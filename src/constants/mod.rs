@@ -1,0 +1,1 @@
+pub const baseUrl: &str = "https://discord.com/api/v10";
