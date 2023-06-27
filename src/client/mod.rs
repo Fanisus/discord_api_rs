@@ -1,11 +1,12 @@
 use crate::constants;
+use crate::intents::Intents;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{self, Url};
-use std::time::Duration;
-use std::{fs, io::Write, sync::Arc};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{json, Map, Number, Value};
+use std::{fs, io::Write, sync::Arc, time::Duration};
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt, sync::Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use native_tls;
@@ -13,7 +14,7 @@ type EventHandlerList = Vec<Arc<Mutex<dyn EventHandler + Send + Sync + 'static>>
 
 #[async_trait]
 pub trait EventHandler: Send + Sync + 'static {
-    async fn on_clientReady(&self, msg: String) {}
+    async fn on_Ready(&self, msg: String) {}
     async fn on_increased(&mut self, amount: i32) {}
     async fn on_decreased(&mut self, amount: i32) {}
 }
@@ -25,11 +26,96 @@ pub trait EventEmitter {
     async fn increase(&mut self, amount: i32) {}
     async fn decrease(&mut self, amount: i32) {}
 }
+#[derive(Clone, Copy, Debug)]
+pub enum Operation {
+    Dispatch,
+    Heartbeat,
+    Identify,
+    PresenceUpdate,
+    VoiceStateUpdate,
+    Resume,
+    Reconnect,
+    RequestGuildMembers,
+    InvalidSession,
+    Hello,
+    HeartbeatAck,
+    Unknown(u8),
+}
+impl From<u8> for Operation {
+    fn from(op: u8) -> Self {
+        use Operation::*;
+        match op {
+            0 => Dispatch,
+            1 => Heartbeat,
+            2 => Identify,
+            3 => PresenceUpdate,
+            4 => VoiceStateUpdate,
+            6 => Resume,
+            7 => Reconnect,
+            8 => RequestGuildMembers,
+            9 => InvalidSession,
+            10 => Hello,
+            11 => HeartbeatAck,
+            n => Unknown(n),
+        }
+    }
+}
+
+impl From<Operation> for u8 {
+    fn from(op: Operation) -> Self {
+        use Operation::*;
+        match op {
+            Dispatch => 0,
+            Heartbeat => 1,
+            Identify => 2,
+            PresenceUpdate => 3,
+            VoiceStateUpdate => 4,
+            Resume => 6,
+            Reconnect => 7,
+            RequestGuildMembers => 8,
+            InvalidSession => 9,
+            Hello => 10,
+            HeartbeatAck => 11,
+            Unknown(n) => n,
+        }
+    }
+}
+
+impl Serialize for Operation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8((*self).into())
+    }
+}
+
+impl<'a> Deserialize<'a> for Operation {
+    fn deserialize<D>(deserializer: D) -> Result<Operation, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        Ok(u8::deserialize(deserializer)?.into())
+    }
+}
+#[derive(Deserialize, Serialize, Debug)]
+pub struct Payload {
+    pub op: Operation,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub d: Option<Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s: Option<u64>,
+}
 #[async_trait]
 impl EventEmitter for Client {
     async fn square(&self, msg: String) {
         for handler in self.event_handler.iter() {
-            handler.lock().await.on_clientReady(msg.clone()).await;
+            handler.lock().await.on_Ready(msg.clone()).await;
         }
 
         // self.on_squared().await;
@@ -51,16 +137,17 @@ impl EventEmitter for Client {
 }
 #[derive(Clone)]
 pub struct Client {
-    // intents: Vec<Intents>,
+    intents: Intents,
     event_handler: EventHandlerList,
     token: String,
 }
+
 impl Client {
     pub fn builder() -> ClientBuilder {
         ClientBuilder {
-            // intents: None,
+            intents: Intents { intents: 0 },
             event_handler: Vec::new(),
-            token: None,
+            token: "".to_string(),
         }
     }
     pub async fn start(mut self) {
@@ -71,46 +158,49 @@ impl Client {
             .build()
             .unwrap();
         let connector = tokio_tungstenite::Connector::NativeTls(tls_connector);
-        let url = Url::parse("wss://gateway.discord.gg?v=9&encoding=utf8").unwrap();
-
+        let url = Url::parse("wss://gateway.discord.gg?v=10&encoding=utf8").unwrap();
         let (mut ws_stream, res) =
             tokio_tungstenite::connect_async_tls_with_config(url, None, true, Some(connector))
                 .await
                 .expect("Failed to connect");
-        println!("{:?}", res);
         let (mut write, mut read) = ws_stream.split();
+        println!("{:?}", res);
+
         tokio::spawn(async move {
             println!("Ready to print incoming data");
             while let Some(message) = read.next().await {
-                println!("{:?}", message);
+                match message.unwrap() {
+                    Message::Text(msg) => {
+                        let data: Value =
+                            serde_json::from_str(&msg).expect("There was a error processing event");
+                        println!("{msg}");
+                    }
+                    _ => {}
+                }
             }
         });
         tokio::spawn(async move {
-            let _ = write
-                .send(Message::Text(
-                    r#"{
-            "op": 2,
-            "d": {
-              "token": "OTYzNDU1MjI5MDIwNDc1NDEy.G5f45k.uakG0G1B3q8hmUPHnKVLa5rGpk0fHQUrp6dAKk",
-              "properties": {
-                "os": "linux",
-                "browser": "disco",
-                "device": "disco"
-              },
-              "compress": false,
-              "intents": 3276799
-            }
-          }"#
-                    .to_string(),
-                ))
-                .await;
+            let data = json!({
+                "op": 2,
+                "d": {
+                    "token": self.token,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "disco",
+                        "device": "disco"
+                    },
+                    "compress": false,
+                    "intents": self.intents.intents
+                }
+            });
+            let _ = write.send(Message::Text(data.to_string())).await;
             loop {
-                write
+                let _ = write
                     .send(Message::Text(
-                        r#"{
-                    "op": 1,
-                    "d": null
-                }"#
+                        json!({
+                            "op": 1,
+                            "d": null
+                        })
                         .to_string(),
                     ))
                     .await;
@@ -130,9 +220,9 @@ impl Client {
 }
 
 pub struct ClientBuilder {
-    // intents: Option<Vec<Intents>>,
+    intents: Intents,
     event_handler: EventHandlerList,
-    token: Option<String>,
+    token: String,
 }
 impl ClientBuilder {
     pub fn add_event_handler(
@@ -144,16 +234,19 @@ impl ClientBuilder {
             .push(Arc::from(Mutex::new(event_handler)));
         self
     }
-    // pub fn intents(mut self, intents: Vec<Intents>) -> ClientBuilder {}
+    pub fn set_intents(mut self, intents: Intents) -> ClientBuilder {
+        self.intents = intents;
+        self
+    }
     pub fn set_token(mut self, token: impl AsRef<str>) -> ClientBuilder {
-        self.token = Some(token.as_ref().to_string());
+        self.token = token.as_ref().to_string();
         self
     }
     pub fn build(self) -> Client {
         Client {
-            // intents: self.intents.expect("Expected Intents"),
+            intents: self.intents,
             event_handler: self.event_handler,
-            token: self.token.expect("Expected Token"),
+            token: self.token,
         }
     }
 }
